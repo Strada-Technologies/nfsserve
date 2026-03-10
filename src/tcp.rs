@@ -17,7 +17,7 @@ use crate::transaction_tracker::TransactionTracker;
 pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     listener: TcpListener,
     port: u16,
-    arcfs: Arc<T>,
+    fs: Arc<T>,
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
@@ -109,7 +109,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     /// Binds to a ipstr of the form [ip address]:port. For instance
     /// "127.0.0.1:12000". fs is an instance of an implementation
     /// of NFSFileSystem.
-    pub async fn bind(ipstr: &str, fs: T) -> io::Result<NFSTcpListener<T>> {
+    pub async fn bind(ipstr: &str, fs: Arc<T>) -> io::Result<NFSTcpListener<T>> {
         let (ip, port) = ipstr.split_once(':').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
@@ -123,15 +123,13 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             )
         })?;
 
-        let arcfs: Arc<T> = Arc::new(fs);
-
         if ip == "auto" {
             let mut num_tries_left = 32;
 
             for try_ip in 1u16.. {
                 let ip = generate_host_ip(try_ip);
 
-                let result = NFSTcpListener::bind_internal(&ip, port, arcfs.clone()).await;
+                let result = NFSTcpListener::bind_internal(&ip, port, fs.clone()).await;
 
                 match &result {
                     Err(_) => {
@@ -150,11 +148,11 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             unreachable!(); // Does not detect automatically that loop above never terminates.
         } else {
             // Otherwise, try this.
-            NFSTcpListener::bind_internal(ip, port, arcfs).await
+            NFSTcpListener::bind_internal(ip, port, fs).await
         }
     }
 
-    async fn bind_internal(ip: &str, port: u16, arcfs: Arc<T>) -> io::Result<NFSTcpListener<T>> {
+    async fn bind_internal(ip: &str, port: u16, fs: Arc<T>) -> io::Result<NFSTcpListener<T>> {
         let ipstr = format!("{ip}:{port}");
         let listener = TcpListener::bind(&ipstr).await?;
         info!("Listening on {:?}", &ipstr);
@@ -166,7 +164,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         Ok(NFSTcpListener {
             listener,
             port,
-            arcfs,
+            fs,
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
@@ -217,7 +215,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 local_port: self.port,
                 client_addr: socket.peer_addr().unwrap().to_string(),
                 auth: crate::rpc::auth_unix::default(),
-                vfs: self.arcfs.clone(),
+                vfs: self.fs.clone(),
                 mount_signal: self.mount_signal.clone(),
                 export_name: self.export_name.clone(),
                 transaction_tracker: self.transaction_tracker.clone(),
