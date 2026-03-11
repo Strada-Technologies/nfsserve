@@ -38,7 +38,7 @@ pub const NFS3_WRITEVERFSIZE: u32 = 8;
 
 // Section 2.5 Basic Data Types
 #[allow(non_camel_case_types)]
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq, Eq, Hash)]
 pub struct nfsstring(pub Vec<u8>);
 impl nfsstring {
     pub fn len(&self) -> usize {
