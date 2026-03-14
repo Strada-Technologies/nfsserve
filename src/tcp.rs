@@ -158,7 +158,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
                         Err(e) => anyhow::bail!("Listener accept error: {e:?}")
                     }
                 }
-                _ = self.socket_tasks.join_next() => {
+                Some(_) = self.socket_tasks.join_next() => {
                     tracing::trace!("Socket task finished");
                 }
                 _ = self.cancellation_token.cancelled() => {
