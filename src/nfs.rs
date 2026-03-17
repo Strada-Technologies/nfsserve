@@ -244,7 +244,7 @@ impl Default for nfs_fh3 {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
 #[repr(C)]
 pub struct nfstime3 {
     pub seconds: u32,
