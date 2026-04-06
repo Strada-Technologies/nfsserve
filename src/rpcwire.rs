@@ -188,45 +188,56 @@ impl SocketHandler {
             }
         });
 
-        loop {
-            tokio::select! {
-                _ = self.socket.readable() => {
-                    let mut buf = [0; 128000];
+        let result = async {
+            loop {
+                tokio::select! {
+                    _ = self.socket.readable() => {
+                        let mut buffer = [0; 128000];
 
-                    match self.socket.try_read(&mut buf) {
-                        Ok(0) => {
-                            return Ok(());
+                        match self.socket.try_read(&mut buffer) {
+                            // Socket sned signal to close
+                            Ok(0) => {
+                                return Ok(());
+                            }
+                            Ok(n) => {
+                                socket_tx.write_all(&buffer[..n]).await?;
+                            }
+                            // Recoverable errors
+                            Err(ref e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(e.into());
+                            }
                         }
-                        Ok(n) => {
-                            let _ = socket_tx.write_all(&buf[..n]).await;
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            continue;
-                        }
-                        Err(e) => {
-                            debug!("Message handling closed: {:?}", e);
-                            return Err(e.into());
+
+                    },
+
+                    fragment = fragment_rx.recv() => {
+                        match fragment {
+                            Some(fragment) => self.handle_message(fragment, response_tx.clone(), self.cancellation_token.clone()).await,
+                            None => return Ok(()),
                         }
                     }
 
-                },
-
-                Some(fragment) = fragment_rx.recv() => {
-                    self.handle_message(fragment, response_tx.clone(), self.cancellation_token.clone()).await;
-                }
-
-                Some(response) = response_rx.recv() => {
-                    if let Err(e) = write_fragment(&mut self.socket, &response).await {
-                        error!("Write error {:?}", e);
+                    response = response_rx.recv() => {
+                        match response {
+                            Some(response) => write_fragment(&mut self.socket, &response).await?,
+                            None => return Ok(()),
+                        }
                     }
-                }
 
-                _ = self.cancellation_token.cancelled() => {
-                    self.message_tasks.join_all().await;
-                    return Ok(())
+                    _ = self.cancellation_token.cancelled() => {
+                        return Ok(())
+                    }
                 }
             }
-        }
+        }.await;
+
+        self.cancellation_token.cancel();
+        self.message_tasks.join_all().await;
+
+        result
     }
 
     pub async fn handle_message(&mut self, fragment: Vec<u8>, response_tx: UnboundedSender<Vec<u8>>, cancellation_token: CancellationToken) {

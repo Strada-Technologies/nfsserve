@@ -147,7 +147,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
                             info!("Accepting connection from {}", context.client_addr);
                             debug!("Accepting socket {:?} {:?}", socket, context);
 
-                            let socket_handler = SocketHandler::new(socket, &context, self.cancellation_token.clone());
+                            let socket_handler = SocketHandler::new(socket, &context, self.cancellation_token.child_token());
                             self.socket_tasks.spawn(async move {
                                 if let Err(err) = socket_handler.run().await {
                                     tracing::error!("Nfs process_socket error: {err:?}")
