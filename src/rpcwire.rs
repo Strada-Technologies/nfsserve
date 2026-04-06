@@ -195,7 +195,7 @@ impl SocketHandler {
                         let mut buffer = [0; 128000];
 
                         match self.socket.try_read(&mut buffer) {
-                            // Socket sned signal to close
+                            // Socket sent signal to close
                             Ok(0) => {
                                 return Ok(());
                             }
