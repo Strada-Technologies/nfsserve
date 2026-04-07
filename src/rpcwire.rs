@@ -221,7 +221,6 @@ impl SocketMessageHandler {
                         let _ = send.send(Err(e));
                     }
                     Ok(true) => {
-                        let _ = std::io::Write::flush(&mut write_cursor);
                         let _ = send.send(Ok(write_buf));
                     }
                     Ok(false) => {

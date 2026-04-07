@@ -73,6 +73,8 @@ async fn process_socket(
                     break;
                 }
                 Ok(n) => {
+                    trace!(num_of_bytes = %n, "bytes read from socket");
+
                     let _ = socksend.write_all(&buf[..n]).await;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
