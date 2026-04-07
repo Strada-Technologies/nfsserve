@@ -1,7 +1,4 @@
 use anyhow::anyhow;
-use tokio::net::TcpStream;
-use tokio::task::{JoinHandle, JoinSet};
-use tokio_util::sync::CancellationToken;
 use std::io::Cursor;
 use std::io::{Read, Write};
 use tracing::{debug, error, trace, warn};
@@ -18,10 +15,10 @@ use crate::nfs_handlers;
 
 use crate::portmap;
 use crate::portmap_handlers;
-use tokio::io::{self, AsyncReadExt};
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc;
 
 // Information from RFC 5531
 // https://datatracker.ietf.org/doc/html/rfc5531
@@ -129,7 +126,7 @@ async fn read_fragment(
 }
 
 pub async fn write_fragment(
-    socket: &mut TcpStream,
+    socket: &mut tokio::net::TcpStream,
     buf: &Vec<u8>,
 ) -> Result<(), anyhow::Error> {
     // TODO: split into many fragments
@@ -143,131 +140,70 @@ pub async fn write_fragment(
     Ok(())
 }
 
+pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
+
 /// The Socket Message Handler reads from a TcpStream and spawns off
 /// subtasks to handle each message. replies are queued into the
 /// reply_send_channel.
 #[derive(Debug)]
-pub struct SocketHandler {
-    socket: TcpStream,
+pub struct SocketMessageHandler {
+    cur_fragment: Vec<u8>,
+    socket_receive_channel: DuplexStream,
+    reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
-    message_tasks: JoinSet<()>,
-    cancellation_token: CancellationToken,
 }
 
-impl SocketHandler {
+impl SocketMessageHandler {
     /// Creates a new SocketMessageHandler with the receiver for queued message replies
-    pub fn new(socket: TcpStream, context: &RPCContext, cancellation_token: CancellationToken) -> Self {
-        Self {
-            socket,
-            context: context.clone(),
-            message_tasks: JoinSet::new(),
-            cancellation_token,
+    pub fn new(
+        context: &RPCContext,
+    ) -> (
+        Self,
+        DuplexStream,
+        mpsc::UnboundedReceiver<SocketMessageType>,
+    ) {
+        let (socksend, sockrecv) = tokio::io::duplex(256000);
+        let (msgsend, msgrecv) = mpsc::unbounded_channel();
+        (
+            Self {
+                cur_fragment: Vec::new(),
+                socket_receive_channel: sockrecv,
+                reply_send_channel: msgsend,
+                context: context.clone(),
+            },
+            socksend,
+            msgrecv,
+        )
+    }
+
+    /// Reads a fragment from the socket. This should be looped.
+    pub async fn read(&mut self) -> Result<(), anyhow::Error> {
+        let is_last =
+            read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
+        if is_last {
+            let fragment = std::mem::take(&mut self.cur_fragment);
+            let context = self.context.clone();
+            let send = self.reply_send_channel.clone();
+            tokio::spawn(async move {
+                let mut write_buf: Vec<u8> = Vec::new();
+                let mut write_cursor = Cursor::new(&mut write_buf);
+                let maybe_reply =
+                    handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
+                match maybe_reply {
+                    Err(e) => {
+                        error!("RPC Error: {:?}", e);
+                        let _ = send.send(Err(e));
+                    }
+                    Ok(true) => {
+                        let _ = std::io::Write::flush(&mut write_cursor);
+                        let _ = send.send(Ok(write_buf));
+                    }
+                    Ok(false) => {
+                        // do not reply
+                    }
+                }
+            });
         }
-    }
-
-    pub async fn run(mut self) -> Result<(), anyhow::Error> {
-
-        let (mut socket_tx, mut socket_rx) = tokio::io::duplex(256000);
-        let (fragment_tx, mut fragment_rx) = mpsc::unbounded_channel();
-        let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-
-        let _ = self.socket.set_nodelay(true);
-
-        // Reads fragments from the socket.
-        // Cannot be in the tokio::select! because read_fragment is not cancel safe
-        let _: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            let mut current_fragment = Vec::new();
-
-            loop {
-                let is_last =
-                    read_fragment(&mut socket_rx, &mut current_fragment).await?;
-                if is_last {
-                    let fragment = std::mem::take(&mut current_fragment);
-                    fragment_tx.send(fragment)?;
-                }
-            }
-        });
-
-        let result = async {
-            loop {
-                tokio::select! {
-                    _ = self.socket.readable() => {
-                        let mut buffer = [0; 128000];
-
-                        match self.socket.try_read(&mut buffer) {
-                            // Socket sent signal to close
-                            Ok(0) => {
-                                return Ok(());
-                            }
-                            Ok(n) => {
-                                socket_tx.write_all(&buffer[..n]).await?;
-                            }
-                            // Recoverable errors
-                            Err(ref e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
-                                continue;
-                            }
-                            Err(e) => {
-                                return Err(e.into());
-                            }
-                        }
-
-                    },
-
-                    fragment = fragment_rx.recv() => {
-                        match fragment {
-                            Some(fragment) => self.handle_message(fragment, response_tx.clone(), self.cancellation_token.clone()).await,
-                            None => return Ok(()),
-                        }
-                    }
-
-                    response = response_rx.recv() => {
-                        match response {
-                            Some(response) => write_fragment(&mut self.socket, &response).await?,
-                            None => return Ok(()),
-                        }
-                    }
-
-                    _ = self.cancellation_token.cancelled() => {
-                        return Ok(())
-                    }
-                }
-            }
-        }.await;
-
-        self.cancellation_token.cancel();
-        self.message_tasks.join_all().await;
-
-        result
-    }
-
-    pub async fn handle_message(&mut self, fragment: Vec<u8>, response_tx: UnboundedSender<Vec<u8>>, cancellation_token: CancellationToken) {
-
-        let context = self.context.clone();
-
-        self.message_tasks.spawn(async move {
-
-            let mut fragment_cursor = Cursor::new(fragment);
-            
-            let mut write_buf: Vec<u8> = Vec::new();
-            let mut write_cursor = Cursor::new(&mut write_buf);
-
-            let rpc = handle_rpc(&mut fragment_cursor, &mut write_cursor, context);
-
-            let result = tokio::select! {
-                result = rpc => result,
-                _ = cancellation_token.cancelled() => return
-            };
-                
-            match result {
-                Ok(true) => {
-                    let _ = std::io::Write::flush(&mut write_cursor);
-                    let _ = response_tx.send(write_buf);
-                }
-                Ok(false) => (),
-                Err(e) => {
-                    error!("RPC Error: {e:?}");
-                }
-            }
-        });
+        Ok(())
     }
 }
