@@ -229,6 +229,13 @@ impl SocketMessageHandler {
                 }
             });
         }
+
         Ok(())
+    }
+
+    pub async fn join_all(&mut self) {
+        while let Some(Ok(_)) = self.fragment_tasks.join_next().await {
+            trace!("fragment task ended");
+        }
     }
 }

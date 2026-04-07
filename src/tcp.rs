@@ -55,6 +55,8 @@ async fn process_socket(
         loop {
             if let Err(e) = message_handler.read().await {
                 debug!("Message loop broken due to {:?}", e);
+                message_handler.join_all().await;
+
                 break;
             }
         }
