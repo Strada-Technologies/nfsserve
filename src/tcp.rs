@@ -42,19 +42,17 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 
 /// processes an established socket
 async fn process_socket(
-    mut socket: tokio::net::TcpStream,
+    socket: tokio::net::TcpStream,
     context: RPCContext,
     socket_tasks: Arc<Mutex<JoinSet<()>>>,
 ) -> Result<(), anyhow::Error> {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
-    let _ = socket.set_zero_linger();
 
     let mut locked_tasks = socket_tasks.lock().await;
 
     locked_tasks.spawn(async move {
         loop {
-            trace!("message handler loop running!!");
             if let Err(e) = message_handler.read().await {
                 debug!("Message loop broken due to {:?}", e);
                 break;
@@ -62,37 +60,38 @@ async fn process_socket(
         }
     });
 
+    let (rx, mut tx) = socket.into_split();
+
     locked_tasks.spawn(async move {
-        let (rx, mut tx) = socket.split();
-
         loop {
-            tokio::select! {
-                _ = rx.readable() => {
-                    let mut buf = [0; 128000];
+            let _ = rx.readable().await;
 
-                    match rx.try_read(&mut buf) {
-                        Ok(0) => {
-                            break;
-                        }
-                        Ok(n) => {
-                            let _ = socksend.write_all(&buf[..n]).await;
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            continue;
-                        }
-                        Err(e) => {
-                            debug!("Message handling closed : {:?}", e);
-                            break;
-                        }
-                    }
+            let mut buf = [0; 128000];
 
-                },
-                Some(Ok(msg)) = msgrecvchan.recv() => {
-                    if let Err(e) = write_fragment(&mut tx, &msg).await {
-                        error!("Write error {:?}", e);
-                    }
-
+            match rx.try_read(&mut buf) {
+                Ok(0) => {
+                    break;
                 }
+                Ok(n) => {
+                    let _ = socksend.write_all(&buf[..n]).await;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    trace!(warning = %e, "nfs error");
+
+                    continue;
+                }
+                Err(e) => {
+                    debug!("Message handling closed : {:?}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    locked_tasks.spawn(async move {
+        while let Some(Ok(msg)) = msgrecvchan.recv().await {
+            if let Err(e) = write_fragment(&mut tx, &msg).await {
+                error!("Write error {:?}", e);
             }
         }
     });
@@ -242,8 +241,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()> {
-        loop {
-            let (socket, _) = self.listener.accept().await?;
+        while let Ok((socket, _)) = self.listener.accept().await {
             let context = RPCContext {
                 local_port: self.port,
                 client_addr: socket.peer_addr().unwrap().to_string(),
@@ -258,5 +256,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
             let _ = process_socket(socket, context, self.socket_tasks.clone()).await;
         }
+
+        Ok(())
     }
 }

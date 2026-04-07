@@ -16,8 +16,8 @@ use crate::nfs_handlers;
 
 use crate::portmap;
 use crate::portmap_handlers;
-use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -28,7 +28,7 @@ const NFS_ACL_PROGRAM: u32 = 100227;
 const NFS_ID_MAP_PROGRAM: u32 = 100270;
 const NFS_METADATA_PROGRAM: u32 = 200024;
 
-async fn handle_rpc(
+pub async fn handle_rpc(
     input: &mut impl Read,
     output: &mut impl Write,
     mut context: RPCContext,
@@ -119,10 +119,13 @@ async fn handle_rpc(
 /// length in bytes of the fragment's data.  The boolean value is the
 /// highest-order bit of the header; the length is the 31 low-order bits.
 /// (Note that this record specification is NOT in XDR standard form!)
-async fn read_fragment(
-    socket: &mut DuplexStream,
+pub async fn read_fragment<R>(
+    socket: &mut R,
     append_to: &mut Vec<u8>,
-) -> Result<bool, anyhow::Error> {
+) -> Result<bool, anyhow::Error>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header_buf = [0_u8; 4];
     socket.read_exact(&mut header_buf).await?;
     let fragment_header = u32::from_be_bytes(header_buf);
