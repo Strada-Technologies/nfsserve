@@ -1,17 +1,25 @@
-use crate::context::RPCContext;
-use crate::rpcwire::*;
-use crate::vfs::NFSFileSystem;
-use anyhow;
-use async_trait::async_trait;
+use std::io;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::{io, net::IpAddr};
 use std::time::Duration;
+
+use anyhow;
+use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+use tracing::trace;
+
+use crate::context::RPCContext;
+use crate::rpcwire::*;
 use crate::transaction_tracker::TransactionTracker;
+use crate::vfs::NFSFileSystem;
 
 /// A NFS Tcp Connection Handler
 pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
@@ -21,6 +29,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
+    socket_tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -35,58 +44,60 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 async fn process_socket(
     mut socket: tokio::net::TcpStream,
     context: RPCContext,
+    socket_tasks: Arc<Mutex<JoinSet<()>>>,
 ) -> Result<(), anyhow::Error> {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
+    let _ = socket.set_zero_linger();
 
-    tokio::spawn(async move {
+    let mut locked_tasks = socket_tasks.lock().await;
+
+    locked_tasks.spawn(async move {
         loop {
+            trace!("message handler loop running!!");
             if let Err(e) = message_handler.read().await {
                 debug!("Message loop broken due to {:?}", e);
                 break;
             }
         }
     });
-    loop {
-        tokio::select! {
-            _ = socket.readable() => {
-                let mut buf = [0; 128000];
 
-                match socket.try_read(&mut buf) {
-                    Ok(0) => {
-                        return Ok(());
-                    }
-                    Ok(n) => {
-                        let _ = socksend.write_all(&buf[..n]).await;
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e.into());
-                    }
-                }
+    locked_tasks.spawn(async move {
+        let (rx, mut tx) = socket.split();
 
-            },
-            reply = msgrecvchan.recv() => {
-                match reply {
-                    Some(Err(e)) => {
-                        debug!("Message handling closed : {:?}", e);
-                        return Err(e);
-                    }
-                    Some(Ok(msg)) => {
-                        if let Err(e) = write_fragment(&mut socket, &msg).await {
-                            error!("Write error {:?}", e);
+        loop {
+            tokio::select! {
+                _ = rx.readable() => {
+                    let mut buf = [0; 128000];
+
+                    match rx.try_read(&mut buf) {
+                        Ok(0) => {
+                            break;
+                        }
+                        Ok(n) => {
+                            let _ = socksend.write_all(&buf[..n]).await;
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("Message handling closed : {:?}", e);
+                            break;
                         }
                     }
-                    None => {
-                        return Err(anyhow::anyhow!("Unexpected socket context termination"));
+
+                },
+                Some(Ok(msg)) = msgrecvchan.recv() => {
+                    if let Err(e) = write_fragment(&mut tx, &msg).await {
+                        error!("Write error {:?}", e);
                     }
+
                 }
             }
         }
-    }
+    });
+
+    Ok(())
 }
 
 #[async_trait]
@@ -106,6 +117,27 @@ pub trait NFSTcp: Send + Sync {
 }
 
 impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
+    pub fn new(
+        listener: TcpListener,
+        port: u16,
+        fs: Arc<T>,
+        mount_signal: Option<mpsc::Sender<bool>>,
+        export_name: Arc<String>,
+        transaction_tracker: Arc<TransactionTracker>,
+    ) -> Self {
+        let socket_tasks = Arc::new(Mutex::new(JoinSet::new()));
+
+        Self {
+            listener,
+            port,
+            fs,
+            mount_signal,
+            export_name,
+            transaction_tracker,
+            socket_tasks,
+        }
+    }
+
     /// Binds to a ipstr of the form [ip address]:port. For instance
     /// "127.0.0.1:12000". fs is an instance of an implementation
     /// of NFSFileSystem.
@@ -168,6 +200,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            socket_tasks: Arc::new(Mutex::new(JoinSet::new())),
         })
     }
 
@@ -222,9 +255,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);
-            tokio::spawn(async move {
-                let _ = process_socket(socket, context).await;
-            });
+
+            let _ = process_socket(socket, context, self.socket_tasks.clone()).await;
         }
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use std::io::Cursor;
 use std::io::{Read, Write};
+use tokio::task::JoinSet;
 use tracing::{debug, error, trace, warn};
 
 use crate::context::RPCContext;
@@ -15,9 +16,9 @@ use crate::nfs_handlers;
 
 use crate::portmap;
 use crate::portmap_handlers;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
 
 // Information from RFC 5531
@@ -47,10 +48,16 @@ async fn handle_rpc(
             return Ok(true);
         }
 
-        if context.transaction_tracker.is_retransmission(xid, &context.client_addr) {
+        if context
+            .transaction_tracker
+            .is_retransmission(xid, &context.client_addr)
+        {
             // This is a retransmission
             // Drop the message and return
-            debug!("Retransmission detected, xid: {}, client_addr: {}, call: {:?}", xid, context.client_addr, call);
+            debug!(
+                "Retransmission detected, xid: {}, client_addr: {}, call: {:?}",
+                xid, context.client_addr, call
+            );
             return Ok(false);
         }
 
@@ -66,6 +73,7 @@ async fn handle_rpc(
                 || call.prog == NFS_METADATA_PROGRAM
             {
                 trace!("ignoring NFS_ACL packet");
+
                 prog_unavail_reply_message(xid).serialize(output)?;
                 Ok(())
             } else {
@@ -74,14 +82,21 @@ async fn handle_rpc(
                     call.prog,
                     nfs::PROGRAM
                 );
+
                 prog_unavail_reply_message(xid).serialize(output)?;
                 Ok(())
             }
-        }.map(|_| true);
-        context.transaction_tracker.mark_processed(xid, &context.client_addr);
+        }
+        .map(|_| true);
+
+        context
+            .transaction_tracker
+            .mark_processed(xid, &context.client_addr);
+
         res
     } else {
         error!("Unexpectedly received a Reply instead of a Call");
+
         Err(anyhow!("Bad RPC Call format"))
     }
 }
@@ -125,10 +140,10 @@ async fn read_fragment(
     Ok(is_last)
 }
 
-pub async fn write_fragment(
-    socket: &mut tokio::net::TcpStream,
-    buf: &Vec<u8>,
-) -> Result<(), anyhow::Error> {
+pub async fn write_fragment<R>(socket: &mut R, buf: &[u8]) -> Result<(), anyhow::Error>
+where
+    R: AsyncWrite + Unpin,
+{
     // TODO: split into many fragments
     assert!(buf.len() < (1 << 31));
     // set the last flag
@@ -151,6 +166,7 @@ pub struct SocketMessageHandler {
     socket_receive_channel: DuplexStream,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
+    fragment_tasks: JoinSet<()>,
 }
 
 impl SocketMessageHandler {
@@ -170,6 +186,7 @@ impl SocketMessageHandler {
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
+                fragment_tasks: JoinSet::new(),
             },
             socksend,
             msgrecv,
@@ -178,17 +195,23 @@ impl SocketMessageHandler {
 
     /// Reads a fragment from the socket. This should be looped.
     pub async fn read(&mut self) -> Result<(), anyhow::Error> {
+        trace!("message handler read!");
+
         let is_last =
             read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
+
         if is_last {
             let fragment = std::mem::take(&mut self.cur_fragment);
             let context = self.context.clone();
             let send = self.reply_send_channel.clone();
-            tokio::spawn(async move {
+
+            self.fragment_tasks.spawn(async move {
                 let mut write_buf: Vec<u8> = Vec::new();
                 let mut write_cursor = Cursor::new(&mut write_buf);
+
                 let maybe_reply =
                     handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
+
                 match maybe_reply {
                     Err(e) => {
                         error!("RPC Error: {:?}", e);
