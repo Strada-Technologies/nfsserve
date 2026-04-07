@@ -261,6 +261,12 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             let _ = process_socket(socket, context, self.socket_tasks.clone()).await;
         }
 
+        let mut tasks = self.socket_tasks.lock().await;
+
+        while let Some(Ok(_)) = tasks.join_next().await {
+            trace!("task completed");
+        }
+
         Ok(())
     }
 }
