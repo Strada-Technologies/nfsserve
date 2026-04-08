@@ -16,9 +16,9 @@ use crate::nfs_handlers;
 
 use crate::portmap;
 use crate::portmap_handlers;
-use tokio::io::DuplexStream;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWriteExt, WriteHalf};
 use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::io::{DuplexStream, ReadHalf, SimplexStream};
 use tokio::sync::mpsc;
 
 // Information from RFC 5531
@@ -166,7 +166,7 @@ pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
 #[derive(Debug)]
 pub struct SocketMessageHandler {
     cur_fragment: Vec<u8>,
-    socket_receive_channel: DuplexStream,
+    socket_receive_channel: ReadHalf<SimplexStream>,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
     fragment_tasks: JoinSet<()>,
@@ -178,10 +178,10 @@ impl SocketMessageHandler {
         context: &RPCContext,
     ) -> (
         Self,
-        DuplexStream,
+        WriteHalf<SimplexStream>,
         mpsc::UnboundedReceiver<SocketMessageType>,
     ) {
-        let (socksend, sockrecv) = tokio::io::duplex(256000);
+        let (sockrecv, socksend) = tokio::io::simplex(1024 * 1024);
         let (msgsend, msgrecv) = mpsc::unbounded_channel();
         (
             Self {

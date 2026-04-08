@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow;
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -48,6 +49,7 @@ async fn process_socket(
 ) -> Result<(), anyhow::Error> {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
+    let _ = socket.set_zero_linger();
 
     let mut locked_tasks = socket_tasks.lock().await;
 
@@ -62,15 +64,15 @@ async fn process_socket(
         }
     });
 
-    let (rx, mut tx) = socket.into_split();
+    let (mut rx, mut tx) = socket.into_split();
+
+    let _ = rx.readable().await;
 
     locked_tasks.spawn(async move {
         loop {
-            let _ = rx.readable().await;
+            let mut buf = [0; 128 * 1024];
 
-            let mut buf = [0; 128000];
-
-            match rx.try_read(&mut buf) {
+            match rx.read(&mut buf).await {
                 Ok(0) => {
                     break;
                 }
