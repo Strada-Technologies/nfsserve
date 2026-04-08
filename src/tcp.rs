@@ -65,7 +65,7 @@ async fn process_socket(
                 }
                 res = message_handler.read() => {
                     match res {
-                        Ok(_) => todo!(),
+                        Ok(_) => {},
                         Err(error) => {
                             debug!("socket pipe loop broken due to {}", error);
                             message_handler.wait().await;
