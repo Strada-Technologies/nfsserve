@@ -50,6 +50,7 @@ async fn process_socket(
 ) {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
+    // https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
     let _ = socket.set_zero_linger();
 
     let ct = cancellation_token.clone();
@@ -101,6 +102,9 @@ async fn process_socket(
                 res = rx.read(&mut buf) => {
                     match res {
                         Ok(0) => {
+                            // Cancels the other tasks
+                            ct.cancel();
+
                             break;
                         }
                         Ok(n) => {
@@ -156,6 +160,11 @@ async fn process_socket(
 
                         // Cancels the other tasks
                         ct.cancel();
+
+                        // Flush any remaining data before exiting
+                        if let Err(error) = tx.flush().await {
+                            error!(%error, "error while flushing data");
+                        }
 
                         break;
                     }
