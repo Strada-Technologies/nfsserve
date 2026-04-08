@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -31,6 +32,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
     socket_tasks: Arc<Mutex<JoinSet<()>>>,
+    cancellation_token: CancellationToken,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -46,73 +48,127 @@ async fn process_socket(
     socket: tokio::net::TcpStream,
     context: RPCContext,
     socket_tasks: Arc<Mutex<JoinSet<()>>>,
-) -> Result<(), anyhow::Error> {
+    cancellation_token: CancellationToken,
+) {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
     let _ = socket.set_zero_linger();
 
     let mut locked_tasks = socket_tasks.lock().await;
 
+    let ct = cancellation_token.clone();
     locked_tasks.spawn(async move {
         loop {
-            if let Err(e) = message_handler.read().await {
-                debug!("Message loop broken due to {:?}", e);
-                message_handler.join_all().await;
+            tokio::select! {
+                _ = ct.cancelled() => {
+                    debug!("socket pipe task cancelled");
 
-                break;
+                    message_handler.join_all().await;
+
+                    break;
+                }
+                res = message_handler.read() => {
+                    match res {
+                        Ok(_) => todo!(),
+                        Err(error) => {
+                            debug!("socket pipe loop broken due to {}", error);
+                            message_handler.join_all().await;
+
+                            // Cancels the other tasks
+                            ct.cancel();
+
+                            break;
+                        },
+                    }
+                }
             }
         }
+
+        debug!("socket pipe task exiting");
     });
 
     let (mut rx, mut tx) = socket.into_split();
 
     let _ = rx.readable().await;
 
+    let ct = cancellation_token.clone();
     locked_tasks.spawn(async move {
         loop {
             let mut buf = [0; 128 * 1024];
 
-            match rx.read(&mut buf).await {
-                Ok(0) => {
+            tokio::select! {
+                _ = ct.cancelled() => {
+                    debug!("read socket task cancelled");
+
                     break;
                 }
-                Ok(n) => {
-                    trace!(num_of_bytes = %n, "bytes read from socket");
+                res = rx.read(&mut buf) => {
+                    match res {
+                        Ok(0) => {
+                            break;
+                        }
+                        Ok(n) => {
+                            trace!(num_of_bytes = %n, "bytes read from socket");
 
-                    if let Err(error) = socksend.write_all(&buf[..n]).await {
-                        error!(error = %error, "error writing to simplex");
+                            if let Err(error) = socksend.write_all(&buf[..n]).await {
+                                error!(error = %error, "error writing to simplex");
+
+                            // Cancels the other tasks
+                                ct.cancel();
+
+                                break;
+                            }
+                        }
+                        Err(ref e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            trace!(warning = %e, "nfs error");
+
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("Message handling closed : {:?}", e);
+
+                            // Cancels the other tasks
+                            ct.cancel();
+
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("socket read task exiting");
+    });
+
+    let ct = cancellation_token.clone();
+    locked_tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = ct.cancelled() => {
+                    debug!("socket write task cancelled");
+
+                    break;
+                }
+                Some(Ok(msg)) = msgrecvchan.recv() => {
+                    if let Err(e) = write_fragment(&mut tx, &msg).await {
+                        error!("Write error {:?}", e);
+
+                        // Cancels the other tasks
+                        ct.cancel();
 
                         break;
                     }
                 }
-                Err(ref e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    trace!(warning = %e, "nfs error");
-
-                    continue;
-                }
-                Err(e) => {
-                    debug!("Message handling closed : {:?}", e);
-
-                    break;
-                }
             }
         }
-    });
 
-    locked_tasks.spawn(async move {
-        while let Some(Ok(msg)) = msgrecvchan.recv().await {
-            if let Err(e) = write_fragment(&mut tx, &msg).await {
-                error!("Write error {:?}", e);
-            }
-        }
+        debug!("socket write task exiting");
     });
-
-    Ok(())
 }
 
 #[async_trait]
@@ -139,6 +195,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         mount_signal: Option<mpsc::Sender<bool>>,
         export_name: Arc<String>,
         transaction_tracker: Arc<TransactionTracker>,
+        cancellation_token: CancellationToken,
     ) -> Self {
         let socket_tasks = Arc::new(Mutex::new(JoinSet::new()));
 
@@ -150,13 +207,18 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             export_name,
             transaction_tracker,
             socket_tasks,
+            cancellation_token,
         }
     }
 
     /// Binds to a ipstr of the form [ip address]:port. For instance
     /// "127.0.0.1:12000". fs is an instance of an implementation
     /// of NFSFileSystem.
-    pub async fn bind(ipstr: &str, fs: Arc<T>) -> io::Result<NFSTcpListener<T>> {
+    pub async fn bind(
+        ipstr: &str,
+        fs: Arc<T>,
+        cancellation_token: CancellationToken,
+    ) -> io::Result<NFSTcpListener<T>> {
         let (ip, port) = ipstr.split_once(':').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
@@ -176,7 +238,13 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             for try_ip in 1u16.. {
                 let ip = generate_host_ip(try_ip);
 
-                let result = NFSTcpListener::bind_internal(&ip, port, fs.clone()).await;
+                let result = NFSTcpListener::bind_internal(
+                    &ip,
+                    port,
+                    fs.clone(),
+                    cancellation_token.clone(),
+                )
+                .await;
 
                 match &result {
                     Err(_) => {
@@ -192,14 +260,20 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
                     }
                 }
             }
+
             unreachable!(); // Does not detect automatically that loop above never terminates.
         } else {
             // Otherwise, try this.
-            NFSTcpListener::bind_internal(ip, port, fs).await
+            NFSTcpListener::bind_internal(ip, port, fs, cancellation_token).await
         }
     }
 
-    async fn bind_internal(ip: &str, port: u16, fs: Arc<T>) -> io::Result<NFSTcpListener<T>> {
+    async fn bind_internal(
+        ip: &str,
+        port: u16,
+        fs: Arc<T>,
+        cancellation_token: CancellationToken,
+    ) -> io::Result<NFSTcpListener<T>> {
         let ipstr = format!("{ip}:{port}");
         let listener = TcpListener::bind(&ipstr).await?;
         info!("Listening on {:?}", &ipstr);
@@ -216,6 +290,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
             socket_tasks: Arc::new(Mutex::new(JoinSet::new())),
+            cancellation_token,
         })
     }
 
@@ -257,21 +332,38 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()> {
-        while let Ok((socket, _)) = self.listener.accept().await {
-            let context = RPCContext {
-                local_port: self.port,
-                client_addr: socket.peer_addr().unwrap().to_string(),
-                auth: crate::rpc::auth_unix::default(),
-                vfs: self.fs.clone(),
-                mount_signal: self.mount_signal.clone(),
-                export_name: self.export_name.clone(),
-                transaction_tracker: self.transaction_tracker.clone(),
-            };
-            info!("Accepting connection from {}", context.client_addr);
-            debug!("Accepting socket {:?} {:?}", socket, context);
+        loop {
+            tokio::select! {
+                _ = self.cancellation_token.cancelled() => {
+                    info!("nfs server task cancelled, exiting");
 
-            let _ = process_socket(socket, context, self.socket_tasks.clone()).await;
+                    break;
+                }
+                Ok((socket, _)) = self.listener.accept() => {
+                    let context = RPCContext {
+                        local_port: self.port,
+                        client_addr: socket.peer_addr().unwrap().to_string(),
+                        auth: crate::rpc::auth_unix::default(),
+                        vfs: self.fs.clone(),
+                        mount_signal: self.mount_signal.clone(),
+                        export_name: self.export_name.clone(),
+                        transaction_tracker: self.transaction_tracker.clone(),
+                    };
+                    info!("Accepting connection from {}", context.client_addr);
+                    debug!("Accepting socket {:?} {:?}", socket, context);
+
+                    process_socket(
+                        socket,
+                        context,
+                        self.socket_tasks.clone(),
+                        self.cancellation_token.child_token(),
+                    )
+                    .await;
+                }
+            }
         }
+
+        info!("cleaning up nfs tasks before exiting");
 
         let mut tasks = self.socket_tasks.lock().await;
 
