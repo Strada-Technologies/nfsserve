@@ -109,7 +109,7 @@ async fn process_socket(
                             if let Err(error) = socksend.write_all(&buf[..n]).await {
                                 error!(error = %error, "error writing to simplex");
 
-                            // Cancels the other tasks
+                                // Cancels the other tasks
                                 ct.cancel();
 
                                 break;
