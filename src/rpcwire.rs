@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use std::io::Cursor;
 use std::io::{Read, Write};
 use tokio::task::JoinSet;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, trace, warn};
 
 use crate::context::RPCContext;
@@ -169,7 +170,7 @@ pub struct SocketMessageHandler {
     socket_receive_channel: ReadHalf<SimplexStream>,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
-    fragment_tasks: JoinSet<()>,
+    fragment_tasks: TaskTracker,
 }
 
 impl SocketMessageHandler {
@@ -189,7 +190,7 @@ impl SocketMessageHandler {
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
-                fragment_tasks: JoinSet::new(),
+                fragment_tasks: TaskTracker::new(),
             },
             socksend,
             msgrecv,
@@ -233,9 +234,7 @@ impl SocketMessageHandler {
         Ok(())
     }
 
-    pub async fn join_all(&mut self) {
-        while let Some(Ok(_)) = self.fragment_tasks.join_next().await {
-            trace!("fragment task ended");
-        }
+    pub async fn wait(&mut self) {
+        self.fragment_tasks.wait().await
     }
 }

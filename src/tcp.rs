@@ -4,15 +4,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -31,7 +29,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
-    socket_tasks: Arc<Mutex<JoinSet<()>>>,
+    socket_tasks: TaskTracker,
     cancellation_token: CancellationToken,
 }
 
@@ -47,23 +45,21 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 async fn process_socket(
     socket: tokio::net::TcpStream,
     context: RPCContext,
-    socket_tasks: Arc<Mutex<JoinSet<()>>>,
+    socket_tasks: &TaskTracker,
     cancellation_token: CancellationToken,
 ) {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
     let _ = socket.set_zero_linger();
 
-    let mut locked_tasks = socket_tasks.lock().await;
-
     let ct = cancellation_token.clone();
-    locked_tasks.spawn(async move {
+    socket_tasks.spawn(async move {
         loop {
             tokio::select! {
                 _ = ct.cancelled() => {
                     debug!("socket pipe task cancelled");
 
-                    message_handler.join_all().await;
+                    message_handler.wait().await;
 
                     break;
                 }
@@ -72,7 +68,7 @@ async fn process_socket(
                         Ok(_) => todo!(),
                         Err(error) => {
                             debug!("socket pipe loop broken due to {}", error);
-                            message_handler.join_all().await;
+                            message_handler.wait().await;
 
                             // Cancels the other tasks
                             ct.cancel();
@@ -92,7 +88,7 @@ async fn process_socket(
     let _ = rx.readable().await;
 
     let ct = cancellation_token.clone();
-    locked_tasks.spawn(async move {
+    socket_tasks.spawn(async move {
         loop {
             let mut buf = [0; 128 * 1024];
 
@@ -146,7 +142,7 @@ async fn process_socket(
     });
 
     let ct = cancellation_token.clone();
-    locked_tasks.spawn(async move {
+    socket_tasks.spawn(async move {
         loop {
             tokio::select! {
                 _ = ct.cancelled() => {
@@ -197,7 +193,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         transaction_tracker: Arc<TransactionTracker>,
         cancellation_token: CancellationToken,
     ) -> Self {
-        let socket_tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let socket_tasks = TaskTracker::new();
 
         Self {
             listener,
@@ -289,7 +285,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
-            socket_tasks: Arc::new(Mutex::new(JoinSet::new())),
+            socket_tasks: TaskTracker::new(),
             cancellation_token,
         })
     }
@@ -355,7 +351,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                     process_socket(
                         socket,
                         context,
-                        self.socket_tasks.clone(),
+                        &self.socket_tasks,
                         self.cancellation_token.child_token(),
                     )
                     .await;
@@ -365,11 +361,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
         info!("cleaning up nfs tasks before exiting");
 
-        let mut tasks = self.socket_tasks.lock().await;
-
-        while let Some(Ok(_)) = tasks.join_next().await {
-            trace!("task completed");
-        }
+        self.socket_tasks.wait().await;
 
         Ok(())
     }
