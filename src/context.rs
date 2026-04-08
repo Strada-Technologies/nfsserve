@@ -2,7 +2,6 @@ use crate::transaction_tracker::TransactionTracker;
 use crate::vfs::NFSFileSystem;
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct RPCContext {
@@ -10,7 +9,7 @@ pub struct RPCContext {
     pub client_addr: String,
     pub auth: crate::rpc::auth_unix,
     pub vfs: Arc<dyn NFSFileSystem + Send + Sync>,
-    pub mount_signal: Option<mpsc::Sender<bool>>,
+    pub mount_signal: Option<flume::Sender<bool>>,
     pub export_name: Arc<String>,
     pub transaction_tracker: Arc<TransactionTracker>,
 }
