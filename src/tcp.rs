@@ -79,15 +79,25 @@ async fn process_socket(
                 Ok(n) => {
                     trace!(num_of_bytes = %n, "bytes read from socket");
 
-                    let _ = socksend.write_all(&buf[..n]).await;
+                    if let Err(error) = socksend.write_all(&buf[..n]).await {
+                        error!(error = %error, "error writing to simplex");
+
+                        break;
+                    }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
                     trace!(warning = %e, "nfs error");
 
                     continue;
                 }
                 Err(e) => {
                     debug!("Message handling closed : {:?}", e);
+
                     break;
                 }
             }

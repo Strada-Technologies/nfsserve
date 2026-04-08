@@ -18,7 +18,7 @@ use crate::portmap;
 use crate::portmap_handlers;
 use tokio::io::{AsyncRead, AsyncWriteExt, WriteHalf};
 use tokio::io::{AsyncReadExt, AsyncWrite};
-use tokio::io::{DuplexStream, ReadHalf, SimplexStream};
+use tokio::io::{ReadHalf, SimplexStream};
 use tokio::sync::mpsc;
 
 // Information from RFC 5531
