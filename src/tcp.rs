@@ -162,7 +162,7 @@ async fn process_socket(
                         ct.cancel();
 
                         // Flush any remaining data before exiting
-                        if let Err(error) = tx.flush().await {
+                        if let Err(error) = tx.shutdown().await {
                             error!(%error, "error while flushing data");
                         }
 
