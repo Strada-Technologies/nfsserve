@@ -35,6 +35,7 @@ tokio-util = { version = "0.7", features = ["full"] }
 # demo
 tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }
 intaglio = { version = "1.6", optional = true }
+flume = "0.12.0"
 
 [features]
 strict = []

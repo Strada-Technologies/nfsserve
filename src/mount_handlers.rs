@@ -116,7 +116,7 @@ pub async fn mountproc3_mnt(
         };
         debug!("{:?} --> {:?}", xid, response);
         if let Some(ref chan) = context.mount_signal {
-            let _ = chan.send(true).await;
+            let _ = chan.send(true);
         }
         make_success_reply(xid).serialize(output)?;
         mountstat3::MNT3_OK.serialize(output)?;
@@ -192,7 +192,7 @@ pub async fn mountproc3_umnt(
     let utf8path = std::str::from_utf8(&path).unwrap_or_default();
     debug!("mountproc3_umnt({:?},{:?}) ", xid, utf8path);
     if let Some(ref chan) = context.mount_signal {
-        let _ = chan.send(false).await;
+        let _ = chan.send(false);
     }
     make_success_reply(xid).serialize(output)?;
     mountstat3::MNT3_OK.serialize(output)?;
@@ -207,7 +207,7 @@ pub async fn mountproc3_umnt_all(
 ) -> Result<(), anyhow::Error> {
     debug!("mountproc3_umnt_all({:?}) ", xid);
     if let Some(ref chan) = context.mount_signal {
-        let _ = chan.send(false).await;
+        let _ = chan.send(false);
     }
     make_success_reply(xid).serialize(output)?;
     mountstat3::MNT3_OK.serialize(output)?;

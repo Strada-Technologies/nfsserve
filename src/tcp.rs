@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::debug;
@@ -26,7 +25,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     listener: TcpListener,
     port: u16,
     fs: Arc<T>,
-    mount_signal: Option<mpsc::Sender<bool>>,
+    mount_signal: Option<flume::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
     socket_tasks: TaskTracker,
@@ -52,6 +51,7 @@ async fn process_socket(
     let _ = socket.set_nodelay(true);
     // https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
     let _ = socket.set_zero_linger();
+    let _ = socket.set_ttl(86400);
 
     let ct = cancellation_token.clone();
     socket_tasks.spawn(async move {
@@ -186,7 +186,7 @@ pub trait NFSTcp: Send + Sync {
 
     /// Sets a mount listener. A "true" signal will be sent on a mount
     /// and a "false" will be sent on an unmount
-    fn set_mount_listener(&mut self, signal: mpsc::Sender<bool>);
+    fn set_mount_listener(&mut self, signal: flume::Sender<bool>);
 
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()>;
@@ -197,7 +197,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         listener: TcpListener,
         port: u16,
         fs: Arc<T>,
-        mount_signal: Option<mpsc::Sender<bool>>,
+        mount_signal: Option<flume::Sender<bool>>,
         export_name: Arc<String>,
         transaction_tracker: Arc<TransactionTracker>,
         cancellation_token: CancellationToken,
@@ -331,7 +331,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
     /// Sets a mount listener. A "true" signal will be sent on a mount
     /// and a "false" will be sent on an unmount
-    fn set_mount_listener(&mut self, signal: mpsc::Sender<bool>) {
+    fn set_mount_listener(&mut self, signal: flume::Sender<bool>) {
         self.mount_signal = Some(signal);
     }
 
