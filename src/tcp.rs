@@ -51,7 +51,6 @@ async fn process_socket(
     let _ = socket.set_nodelay(true);
     // https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
     let _ = socket.set_zero_linger();
-    let _ = socket.set_ttl(86400);
 
     let ct = cancellation_token.clone();
     socket_tasks.spawn(async move {
