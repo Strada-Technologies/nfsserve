@@ -1,7 +1,8 @@
 use anyhow::anyhow;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use std::io::Cursor;
 use std::io::{Read, Write};
-use tokio_util::task::TaskTracker;
 use tracing::{debug, error, trace, warn};
 
 use crate::context::RPCContext;
@@ -165,75 +166,82 @@ pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
 /// reply_send_channel.
 #[derive(Debug)]
 pub struct SocketMessageHandler {
-    cur_fragment: Vec<u8>,
+    fragment_buffer: Vec<u8>,
     socket_receive_channel: ReadHalf<SimplexStream>,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
-    fragment_tasks: TaskTracker,
+    cancellation_token: CancellationToken,
+    message_tasks: TaskTracker
 }
 
 impl SocketMessageHandler {
     /// Creates a new SocketMessageHandler with the receiver for queued message replies
     pub fn new(
         context: &RPCContext,
+        cancellation_token: CancellationToken,
     ) -> (
         Self,
         WriteHalf<SimplexStream>,
         mpsc::UnboundedReceiver<SocketMessageType>,
+        TaskTracker
     ) {
         let (sockrecv, socksend) = tokio::io::simplex(1024 * 1024);
         let (msgsend, msgrecv) = mpsc::unbounded_channel();
+        let message_tasks = TaskTracker::new();
         (
             Self {
-                cur_fragment: Vec::new(),
+                fragment_buffer: Vec::new(),
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
-                fragment_tasks: TaskTracker::new(),
+                cancellation_token,
+                message_tasks: message_tasks.clone()
             },
             socksend,
             msgrecv,
+            message_tasks
         )
     }
 
-    /// Reads a fragment from the socket. This should be looped.
-    pub async fn read(&mut self) -> Result<(), anyhow::Error> {
-        trace!("message handler read!");
+    pub async fn read_next(&mut self) -> anyhow::Result<Vec<u8>> {
+        loop {
+            let is_last =
+                read_fragment(&mut self.socket_receive_channel, &mut self.fragment_buffer).await?;
 
-        let is_last =
-            read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
-
-        if is_last {
-            let fragment = std::mem::take(&mut self.cur_fragment);
-            let context = self.context.clone();
-            let send = self.reply_send_channel.clone();
-
-            self.fragment_tasks.spawn(async move {
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = Cursor::new(&mut write_buf);
-
-                let maybe_reply =
-                    handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
-
-                match maybe_reply {
-                    Err(e) => {
-                        error!("RPC Error: {:?}", e);
-                        let _ = send.send(Err(e));
-                    }
-                    Ok(true) => {
-                        let _ = send.send(Ok(write_buf));
-                    }
-                    Ok(false) => {
-                        // do not reply
-                    }
-                }
-            });
+            if is_last {
+                let fragment = std::mem::take(&mut self.fragment_buffer);
+                return Ok(fragment);
+            }
         }
-
-        Ok(())
     }
 
-    pub async fn wait(&mut self) {
-        self.fragment_tasks.wait().await
+    pub fn dispatch(&mut self, fragment: Vec<u8>) {
+        let context = self.context.clone();
+        let cancellation_token = self.cancellation_token.clone();
+        let send = self.reply_send_channel.clone();
+
+        self.message_tasks.spawn(async move {
+            let mut fragment_cursor = Cursor::new(fragment);
+            let mut write_buf = Vec::new();
+            let mut write_cursor = Cursor::new(&mut write_buf);
+
+            let rpc = handle_rpc(&mut fragment_cursor, &mut write_cursor, context);
+
+            let result = tokio::select! {
+                result = rpc => result,
+                _ = cancellation_token.cancelled() => return
+            };
+
+            match result {
+                Ok(true) => {
+                    let _ = send.send(Ok(write_buf));
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    error!("RPC Error: {:?}", err);
+                    let _ = send.send(Err(err));
+                }
+            }
+        });
     }
 }
