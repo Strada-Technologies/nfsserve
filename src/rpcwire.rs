@@ -1,7 +1,7 @@
 use anyhow::anyhow;
+use tokio::task::JoinSet;
 use std::io::Cursor;
 use std::io::{Read, Write};
-use tokio_util::task::TaskTracker;
 use tracing::{debug, error, trace, warn};
 
 use crate::context::RPCContext;
@@ -169,7 +169,7 @@ pub struct SocketMessageHandler {
     socket_receive_channel: ReadHalf<SimplexStream>,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
-    fragment_tasks: TaskTracker,
+    tasks: JoinSet<()>,
 }
 
 impl SocketMessageHandler {
@@ -189,7 +189,7 @@ impl SocketMessageHandler {
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
-                fragment_tasks: TaskTracker::new(),
+                tasks: JoinSet::new(),
             },
             socksend,
             msgrecv,
@@ -207,18 +207,18 @@ impl SocketMessageHandler {
         }
     }
 
-    pub fn dispatch(&self, fragment: Vec<u8>) {
+    pub fn dispatch(&mut self, fragment: Vec<u8>) {
         let context = self.context.clone();
         let send = self.reply_send_channel.clone();
 
-        self.fragment_tasks.spawn(async move {
+        self.tasks.spawn(async move {
             let mut write_buf: Vec<u8> = Vec::new();
             let mut write_cursor = Cursor::new(&mut write_buf);
 
-            let maybe_reply =
+            let reply =
                 handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
 
-            match maybe_reply {
+            match reply {
                 Err(e) => {
                     error!("RPC Error: {:?}", e);
                     let _ = send.send(Err(e));
@@ -231,7 +231,7 @@ impl SocketMessageHandler {
         });
     }
 
-    pub async fn wait(&mut self) {
-        self.fragment_tasks.wait().await
+    pub async fn shutdown(&mut self) {
+        self.tasks.shutdown().await;
     }
 }

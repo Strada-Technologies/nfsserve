@@ -47,22 +47,12 @@ fn process_socket(
     socket_tasks: &TaskTracker,
     cancellation_token: CancellationToken,
 ) {
-    let (message_handler, socksend, msgrecvchan) = SocketMessageHandler::new(&context);
+    let (mut message_handler, socksend, msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
     // https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
     let _ = socket.set_zero_linger();
 
     let (rx, tx) = socket.into_split();
-
-    socket_tasks.spawn({
-        let cancellation_token = cancellation_token.clone();
-        async move {
-            if let Err(e) = run_message_handler(message_handler, cancellation_token.clone()).await {
-                error!(error = %e, "message handler error");
-            }
-            cancellation_token.cancel();
-        }
-    });
 
     socket_tasks.spawn({
         let cancellation_token = cancellation_token.clone();
@@ -83,28 +73,31 @@ fn process_socket(
             cancellation_token.cancel();
         }
     });
+
+    socket_tasks.spawn({
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            if let Err(e) = run_message_handler(&mut message_handler, cancellation_token.clone()).await {
+                error!(error = %e, "message handler error");
+            }
+            cancellation_token.cancel();
+            message_handler.shutdown().await;
+        }
+    });
 }
 
 async fn run_message_handler(
-    mut message_handler: SocketMessageHandler,
+    message_handler: &mut SocketMessageHandler,
     cancellation_token: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
-                message_handler.wait().await;
                 return Ok(());
             }
             result = message_handler.read_next() => {
-                match result {
-                    Ok(Some(fragment)) => {
-                        message_handler.dispatch(fragment);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        message_handler.wait().await;
-                        return Err(error);
-                    }
+                if let Some(fragment) = result? {
+                    message_handler.dispatch(fragment);
                 }
             }
         }
@@ -364,8 +357,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                             let cancellation_token = self.cancellation_token.child_token();
                             process_socket(socket, context, &socket_tasks, cancellation_token);
                         }
-                        Err(e) => {
-                            error!("Listener accept error: {:?}", e);
+                        Err(err) => {
+                            error!("Listener accept error: {err:?}");
                             break;
                         }
                     }
@@ -375,6 +368,8 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
         info!("cleaning up nfs tasks before exiting");
 
+        self.cancellation_token.cancel();
+        self.socket_tasks.close();
         self.socket_tasks.wait().await;
 
         Ok(())
