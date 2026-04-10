@@ -41,138 +41,137 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 }
 
 /// processes an established socket
-async fn process_socket(
+fn process_socket(
     socket: tokio::net::TcpStream,
     context: RPCContext,
     socket_tasks: &TaskTracker,
     cancellation_token: CancellationToken,
 ) {
-    let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
+    let (message_handler, socksend, msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
     // https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
     let _ = socket.set_zero_linger();
 
-    let ct = cancellation_token.clone();
-    socket_tasks.spawn(async move {
-        loop {
-            tokio::select! {
-                _ = ct.cancelled() => {
-                    debug!("socket pipe task cancelled");
+    let (rx, tx) = socket.into_split();
 
-                    message_handler.wait().await;
+    socket_tasks.spawn({
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            if let Err(e) = run_message_handler(message_handler, cancellation_token.clone()).await {
+                error!(error = %e, "message handler error");
+            }
+            cancellation_token.cancel();
+        }
+    });
 
-                    break;
+    socket_tasks.spawn({
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            if let Err(e) = run_socket_reader(rx, socksend, cancellation_token.clone()).await {
+                error!(error = %e, "socket reader error");
+            }
+            cancellation_token.cancel();
+        }
+    });
+
+    socket_tasks.spawn({
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            if let Err(e) = run_socket_writer(tx, msgrecvchan, cancellation_token.clone()).await {
+                error!(error = %e, "socket writer error");
+            }
+            cancellation_token.cancel();
+        }
+    });
+}
+
+async fn run_message_handler(
+    mut message_handler: SocketMessageHandler,
+    cancellation_token: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    loop {
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                message_handler.wait().await;
+                return Ok(());
+            }
+            result = message_handler.process_next() => {
+                match result {
+                    Ok(_) => {},
+                    Err(error) => {
+                        message_handler.wait().await;
+                        return Err(error);
+                    },
                 }
-                res = message_handler.read() => {
-                    match res {
-                        Ok(_) => {},
-                        Err(error) => {
-                            debug!("socket pipe loop broken due to {}", error);
-                            message_handler.wait().await;
+            }
+        }
+    }
+}
 
-                            // Cancels the other tasks
-                            ct.cancel();
+async fn run_socket_reader(
+    mut rx: tokio::net::tcp::OwnedReadHalf,
+    mut socksend: tokio::io::WriteHalf<tokio::io::SimplexStream>,
+    cancellation_token: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    loop {
+        let mut buffer = [0; 128 * 1024];
 
-                            break;
-                        },
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return Ok(());
+            }
+            result = rx.read(&mut buffer) => {
+                match result {
+                    Ok(0) => {
+                        return Ok(());
+                    }
+                    Ok(n) => {
+                        trace!(num_of_bytes = %n, "bytes read from socket");
+                        socksend.write_all(&buffer[..n]).await?;
+                    }
+                    Err(ref e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        trace!(warning = %e, "Recoverable socket reader error");
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e.into());
                     }
                 }
             }
         }
+    }
+}
 
-        debug!("socket pipe task exiting");
-    });
-
-    let (mut rx, mut tx) = socket.into_split();
-
-    let _ = rx.readable().await;
-
-    let ct = cancellation_token.clone();
-    socket_tasks.spawn(async move {
-        loop {
-            let mut buf = [0; 128 * 1024];
-
-            tokio::select! {
-                _ = ct.cancelled() => {
-                    debug!("read socket task cancelled");
-
-                    break;
-                }
-                res = rx.read(&mut buf) => {
-                    match res {
-                        Ok(0) => {
-                            // Cancels the other tasks
-                            ct.cancel();
-
-                            break;
-                        }
-                        Ok(n) => {
-                            trace!(num_of_bytes = %n, "bytes read from socket");
-
-                            if let Err(error) = socksend.write_all(&buf[..n]).await {
-                                error!(error = %error, "error writing to simplex");
-
-                                // Cancels the other tasks
-                                ct.cancel();
-
-                                break;
-                            }
-                        }
-                        Err(ref e)
-                            if matches!(
-                                e.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                            ) =>
-                        {
-                            trace!(warning = %e, "nfs error");
-
-                            continue;
-                        }
-                        Err(e) => {
-                            debug!("Message handling closed : {:?}", e);
-
-                            // Cancels the other tasks
-                            ct.cancel();
-
-                            break;
-                        }
+async fn run_socket_writer(
+    mut tx: tokio::net::tcp::OwnedWriteHalf,
+    mut msgrecvchan: tokio::sync::mpsc::UnboundedReceiver<SocketMessageType>,
+    cancellation_token: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    loop {
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                return Ok(());
+            }
+            reply = msgrecvchan.recv() => {
+                match reply {
+                    Some(Ok(msg)) => {
+                        write_fragment(&mut tx, &msg).await?;
+                    }
+                    Some(Err(e)) => {
+                        return Err(e);
+                    }
+                    None => {
+                        return Ok(());
                     }
                 }
             }
         }
-
-        debug!("socket read task exiting");
-    });
-
-    let ct = cancellation_token.clone();
-    socket_tasks.spawn(async move {
-        loop {
-            tokio::select! {
-                _ = ct.cancelled() => {
-                    debug!("socket write task cancelled");
-
-                    break;
-                }
-                Some(Ok(msg)) = msgrecvchan.recv() => {
-                    if let Err(e) = write_fragment(&mut tx, &msg).await {
-                        error!("Write error {:?}", e);
-
-                        // Cancels the other tasks
-                        ct.cancel();
-
-                        // Flush any remaining data before exiting
-                        if let Err(error) = tx.shutdown().await {
-                            error!(%error, "error while flushing data");
-                        }
-
-                        break;
-                    }
-                }
-            }
-        }
-
-        debug!("socket write task exiting");
-    });
+    }
 }
 
 #[async_trait]
@@ -343,26 +342,30 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
 
                     break;
                 }
-                Ok((socket, _)) = self.listener.accept() => {
-                    let context = RPCContext {
-                        local_port: self.port,
-                        client_addr: socket.peer_addr().unwrap().to_string(),
-                        auth: crate::rpc::auth_unix::default(),
-                        vfs: self.fs.clone(),
-                        mount_signal: self.mount_signal.clone(),
-                        export_name: self.export_name.clone(),
-                        transaction_tracker: self.transaction_tracker.clone(),
-                    };
-                    info!("Accepting connection from {}", context.client_addr);
-                    debug!("Accepting socket {:?} {:?}", socket, context);
+                result = self.listener.accept() => {
+                    match result {
+                        Ok((socket, _)) => {
+                            let context = RPCContext {
+                                local_port: self.port,
+                                client_addr: socket.peer_addr().unwrap().to_string(),
+                                auth: crate::rpc::auth_unix::default(),
+                                vfs: self.fs.clone(),
+                                mount_signal: self.mount_signal.clone(),
+                                export_name: self.export_name.clone(),
+                                transaction_tracker: self.transaction_tracker.clone(),
+                            };
+                            info!("Accepting connection from {}", context.client_addr);
+                            debug!("Accepting socket {:?} {:?}", socket, context);
 
-                    process_socket(
-                        socket,
-                        context,
-                        &self.socket_tasks,
-                        self.cancellation_token.child_token(),
-                    )
-                    .await;
+                            let socket_tasks = self.socket_tasks.clone();
+                            let cancellation_token = self.cancellation_token.child_token();
+                            process_socket(socket, context, &socket_tasks, cancellation_token);
+                        }
+                        Err(e) => {
+                            error!("Listener accept error: {:?}", e);
+                            break;
+                        }
+                    }
                 }
             }
         }

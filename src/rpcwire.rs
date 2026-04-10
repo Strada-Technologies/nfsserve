@@ -165,7 +165,7 @@ pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
 /// reply_send_channel.
 #[derive(Debug)]
 pub struct SocketMessageHandler {
-    cur_fragment: Vec<u8>,
+    current_fragment: Vec<u8>,
     socket_receive_channel: ReadHalf<SimplexStream>,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
@@ -185,7 +185,7 @@ impl SocketMessageHandler {
         let (msgsend, msgrecv) = mpsc::unbounded_channel();
         (
             Self {
-                cur_fragment: Vec::new(),
+                current_fragment: Vec::new(),
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
@@ -197,14 +197,14 @@ impl SocketMessageHandler {
     }
 
     /// Reads a fragment from the socket. This should be looped.
-    pub async fn read(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn process_next(&mut self) -> Result<(), anyhow::Error> {
         trace!("message handler read!");
 
         let is_last =
-            read_fragment(&mut self.socket_receive_channel, &mut self.cur_fragment).await?;
+            read_fragment(&mut self.socket_receive_channel, &mut self.current_fragment).await?;
 
         if is_last {
-            let fragment = std::mem::take(&mut self.cur_fragment);
+            let fragment = std::mem::take(&mut self.current_fragment);
             let context = self.context.clone();
             let send = self.reply_send_channel.clone();
 
