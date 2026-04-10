@@ -95,13 +95,16 @@ async fn run_message_handler(
                 message_handler.wait().await;
                 return Ok(());
             }
-            result = message_handler.process_next() => {
+            result = message_handler.read_next() => {
                 match result {
-                    Ok(_) => {},
+                    Ok(Some(fragment)) => {
+                        message_handler.dispatch(fragment);
+                    }
+                    Ok(None) => {}
                     Err(error) => {
                         message_handler.wait().await;
                         return Err(error);
-                    },
+                    }
                 }
             }
         }

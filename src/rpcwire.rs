@@ -196,41 +196,39 @@ impl SocketMessageHandler {
         )
     }
 
-    /// Reads a fragment from the socket. This should be looped.
-    pub async fn process_next(&mut self) -> Result<(), anyhow::Error> {
-        trace!("message handler read!");
-
+    pub async fn read_next(&mut self) -> Result<Option<Vec<u8>>, anyhow::Error> {
         let is_last =
             read_fragment(&mut self.socket_receive_channel, &mut self.current_fragment).await?;
 
         if is_last {
-            let fragment = std::mem::take(&mut self.current_fragment);
-            let context = self.context.clone();
-            let send = self.reply_send_channel.clone();
-
-            self.fragment_tasks.spawn(async move {
-                let mut write_buf: Vec<u8> = Vec::new();
-                let mut write_cursor = Cursor::new(&mut write_buf);
-
-                let maybe_reply =
-                    handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
-
-                match maybe_reply {
-                    Err(e) => {
-                        error!("RPC Error: {:?}", e);
-                        let _ = send.send(Err(e));
-                    }
-                    Ok(true) => {
-                        let _ = send.send(Ok(write_buf));
-                    }
-                    Ok(false) => {
-                        // do not reply
-                    }
-                }
-            });
+            Ok(Some(std::mem::take(&mut self.current_fragment)))
+        } else {
+            Ok(None)
         }
+    }
 
-        Ok(())
+    pub fn dispatch(&self, fragment: Vec<u8>) {
+        let context = self.context.clone();
+        let send = self.reply_send_channel.clone();
+
+        self.fragment_tasks.spawn(async move {
+            let mut write_buf: Vec<u8> = Vec::new();
+            let mut write_cursor = Cursor::new(&mut write_buf);
+
+            let maybe_reply =
+                handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
+
+            match maybe_reply {
+                Err(e) => {
+                    error!("RPC Error: {:?}", e);
+                    let _ = send.send(Err(e));
+                }
+                Ok(true) => {
+                    let _ = send.send(Ok(write_buf));
+                }
+                Ok(false) => {}
+            }
+        });
     }
 
     pub async fn wait(&mut self) {
