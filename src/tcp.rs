@@ -233,7 +233,17 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         cancellation_token: CancellationToken,
     ) -> io::Result<NFSTcpListener<T>> {
         let ipstr = format!("{ip}:{port}");
-        let listener = TcpListener::bind(&ipstr).await?;
+        let addr: SocketAddr = ipstr
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        socket.bind(addr)?;
+        let listener = socket.listen(1024)?;
         info!("Listening on {:?}", &ipstr);
 
         let port = match listener.local_addr().unwrap() {
