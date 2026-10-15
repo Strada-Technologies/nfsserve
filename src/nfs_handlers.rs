@@ -113,6 +113,28 @@ enum NFSProgram {
     INVALID = 22,
 }
 
+/// Calls that are safe to run twice, so a retransmitted copy needs no
+/// deduplication. The same set Linux's nfsd keeps out of its reply cache.
+pub fn is_safe_to_repeat(proc: u32) -> bool {
+    matches!(
+        NFSProgram::from_u32(proc),
+        Some(
+            NFSProgram::NFSPROC3_NULL
+                | NFSProgram::NFSPROC3_GETATTR
+                | NFSProgram::NFSPROC3_LOOKUP
+                | NFSProgram::NFSPROC3_ACCESS
+                | NFSProgram::NFSPROC3_READLINK
+                | NFSProgram::NFSPROC3_READ
+                | NFSProgram::NFSPROC3_READDIR
+                | NFSProgram::NFSPROC3_READDIRPLUS
+                | NFSProgram::NFSPROC3_FSSTAT
+                | NFSProgram::NFSPROC3_FSINFO
+                | NFSProgram::NFSPROC3_PATHCONF
+                | NFSProgram::NFSPROC3_COMMIT
+        )
+    )
+}
+
 pub async fn handle_nfs(
     xid: u32,
     call: call_body,

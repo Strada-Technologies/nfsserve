@@ -49,9 +49,13 @@ pub async fn handle_rpc(
             return Ok(true);
         }
 
-        if context
-            .transaction_tracker
-            .is_retransmission(xid, &context.client_addr)
+        // Reads are most of the traffic; tracking them would cost every one a
+        // shared lock and an entry kept for the whole retention period.
+        let tracked = !(call.prog == nfs::PROGRAM && nfs_handlers::is_safe_to_repeat(call.proc));
+        if tracked
+            && context
+                .transaction_tracker
+                .is_retransmission(xid, &context.client_addr)
         {
             // This is a retransmission
             // Drop the message and return
@@ -90,9 +94,11 @@ pub async fn handle_rpc(
         }
         .map(|_| true);
 
-        context
-            .transaction_tracker
-            .mark_processed(xid, &context.client_addr);
+        if tracked {
+            context
+                .transaction_tracker
+                .mark_processed(xid, &context.client_addr);
+        }
 
         res
     } else {
