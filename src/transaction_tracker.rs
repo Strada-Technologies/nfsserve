@@ -1,18 +1,30 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Housekeeping walks every tracked transaction under the lock that all RPCs
+/// share, so it runs at most this often rather than on every call.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// `TransactionTracker` tracks the state of transactions to detect retransmissions.
 pub struct TransactionTracker {
     retention_period: Duration,
-    transactions: Mutex<HashMap<(u32, String), TransactionState>>,
+    transactions: Mutex<Transactions>,
+}
+
+struct Transactions {
+    states: HashMap<(u32, String), TransactionState>,
+    last_housekeeping: Instant,
 }
 
 impl TransactionTracker {
     pub fn new(retention_period: Duration) -> Self {
         Self {
             retention_period,
-            transactions: Mutex::new(HashMap::new()),
+            transactions: Mutex::new(Transactions {
+                states: HashMap::new(),
+                last_housekeeping: Instant::now(),
+            }),
         }
     }
 
@@ -27,9 +39,12 @@ impl TransactionTracker {
             .lock()
             .expect("unable to unlock transactions mutex");
 
-        housekeeping(&mut transactions, self.retention_period);
+        if transactions.last_housekeeping.elapsed() >= HOUSEKEEPING_INTERVAL {
+            housekeeping(&mut transactions.states, self.retention_period);
+            transactions.last_housekeeping = Instant::now();
+        }
 
-        if let std::collections::hash_map::Entry::Vacant(e) = transactions.entry(key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = transactions.states.entry(key) {
             e.insert(TransactionState::InProgress);
             false
         } else {
@@ -45,7 +60,7 @@ impl TransactionTracker {
             .transactions
             .lock()
             .expect("unable to unlock transactions mutex");
-        if let Some(tx) = transactions.get_mut(&key) {
+        if let Some(tx) = transactions.states.get_mut(&key) {
             *tx = TransactionState::Completed(completion_time);
         }
     }
